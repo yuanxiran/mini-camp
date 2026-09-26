@@ -26,6 +26,8 @@ SILENCE_STATE_EMIT_INTERVAL_SECONDS = 0.1
 CAMERA_READ_FAILURE_THRESHOLD = 3
 CAMERA_READ_RETRY_SLEEP_SECONDS = 0.01
 PRIMARY_MATCH_MAX_DISTANCE = 0.20
+MAX_RECOGNIZER_RESTARTS_IN_WINDOW = 2
+RECOGNIZER_RESTART_WINDOW_SECONDS = 60.0
 
 
 def emit(message: dict) -> None:
@@ -45,6 +47,35 @@ def protocol_state(state: str) -> str:
 def clamp_unit(value: float) -> float:
     """Clamp a normalized coordinate only at the external PALM boundary."""
     return min(max(float(value), 0.0), 1.0)
+
+
+def create_recognizer(vision, python, model_path):
+    options = vision.GestureRecognizerOptions(
+        base_options=python.BaseOptions(model_asset_path=str(model_path)),
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=2,
+    )
+    return vision.GestureRecognizer.create_from_options(options)
+
+
+def close_recognizer_safely(recognizer) -> None:
+    if recognizer is None:
+        return
+    try:
+        recognizer.close()
+    except Exception as exc:
+        print(f"MediaPipe recognizer close failed after runtime error: {exc}", file=sys.stderr)
+
+
+def is_recognizer_runtime_error(exc: Exception) -> bool:
+    text = str(exc)
+    return (
+        isinstance(exc, RuntimeError)
+        and (
+            "CalculatorGraph::Run" in text
+            or "Packet isn't the sole owner of the holder" in text
+        )
+    )
 
 
 class PrimaryHandSelector:
@@ -156,17 +187,12 @@ def run() -> int:
         print(f"Model file not found: {MODEL_PATH}", file=sys.stderr)
         return 1
 
-    options = vision.GestureRecognizerOptions(
-        base_options=python.BaseOptions(model_asset_path=str(MODEL_PATH)),
-        running_mode=vision.RunningMode.VIDEO,
-        num_hands=2,
-    )
-
     camera = None
     recognizer = None
+    restart_times: list[float] = []
     try:
         try:
-            recognizer = vision.GestureRecognizer.create_from_options(options)
+            recognizer = create_recognizer(vision, python, MODEL_PATH)
         except Exception as exc:
             emit({"v": 1, "type": "CAMERA_STATE", "available": False, "ts_ms": timestamp_ms(started)})
             print(f"Could not load Gesture Recognizer: {exc}", file=sys.stderr)
@@ -262,7 +288,72 @@ def run() -> int:
             if mp_timestamp_ms <= last_timestamp_ms:
                 mp_timestamp_ms = last_timestamp_ms + 1
             last_timestamp_ms = mp_timestamp_ms
-            result = recognizer.recognize_for_video(mp_image, mp_timestamp_ms)
+            try:
+                result = recognizer.recognize_for_video(mp_image, mp_timestamp_ms)
+            except Exception as exc:
+                if not is_recognizer_runtime_error(exc):
+                    raise
+
+                now_for_restart = time.perf_counter()
+                restart_times = [
+                    value
+                    for value in restart_times
+                    if now_for_restart - value <= RECOGNIZER_RESTART_WINDOW_SECONDS
+                ]
+                if len(restart_times) >= MAX_RECOGNIZER_RESTARTS_IN_WINDOW:
+                    print(
+                        "Worker is exiting because MediaPipe recognizer restart limit was reached.",
+                        file=sys.stderr,
+                    )
+                    raise
+
+                restart_times.append(now_for_restart)
+                print(f"MediaPipe GestureRecognizer runtime failure: {exc}", file=sys.stderr)
+                print(
+                    f"Attempting recognizer restart {len(restart_times)}/"
+                    f"{MAX_RECOGNIZER_RESTARTS_IN_WINDOW}...",
+                    file=sys.stderr,
+                )
+                emit({
+                    "v": 1,
+                    "type": "CAMERA_STATE",
+                    "available": False,
+                    "ts_ms": current_ts_ms,
+                })
+
+                # No result derived from the failed recognizer is valid. Drop
+                # all visual continuity before creating a new graph.
+                close_recognizer_safely(recognizer)
+                recognizer = None
+                motion_tracker = MotionTracker()
+                wave_detector = WaveDetector()
+                primary_selector = PrimaryHandSelector()
+                pose_stabilizer = PoseStabilizer()
+                previous_wave_active = False
+                last_pose = None
+                last_gesture = None
+                last_palm_emit_at = None
+                last_silence_emit_at = None
+                last_silence_state = None
+                silence_banner_until = 0.0
+                last_timestamp_ms = -1
+
+                try:
+                    recognizer = create_recognizer(vision, python, MODEL_PATH)
+                except Exception as restart_exc:
+                    print(
+                        f"GestureRecognizer restart failed: {restart_exc}",
+                        file=sys.stderr,
+                    )
+                    raise
+                print("GestureRecognizer restarted successfully.", file=sys.stderr)
+                emit({
+                    "v": 1,
+                    "type": "CAMERA_STATE",
+                    "available": True,
+                    "ts_ms": timestamp_ms(started),
+                })
+                continue
 
             infos = make_hand_infos(result)
             primary_hand, primary_changed = primary_selector.select(infos)
@@ -381,8 +472,7 @@ def run() -> int:
             camera.release()
         if args.preview:
             cv2.destroyAllWindows()
-        if recognizer is not None:
-            recognizer.close()
+        close_recognizer_safely(recognizer)
 
     return 0
 

@@ -80,8 +80,8 @@ game-facing label, while `PALM` reports the normalized palm position.
 ```
 
 - `available: true`: Gesture Recognizer loaded and camera opened.
-- `available: false`: camera/model startup failed or a camera frame could not
-  be read.
+- `available: false`: camera/model startup failed, a camera frame could not be
+  read, or the worker is temporarily recovering a recognizer graph failure.
 - On a normal startup, the first protocol message is `available: true`.
 - If the Python import or model path check fails before worker initialization,
   the current code reports the error on stderr and exits before emitting a
@@ -219,3 +219,12 @@ During the unavailable period it emits no `PALM`, `GESTURE`, `WAVE`,
 successfully, it emits `CAMERA_STATE available:true` once and resumes with
 fresh tracking baselines. The worker does not implement a separate camera
 reopen/backoff subsystem.
+
+An occasional recognized MediaPipe graph runtime failure is handled with a
+bounded restart attempt. The worker emits `available:false`, discards all
+frame-derived continuity (primary hand, motion/WAVE/stillness, and
+two-hand-pose timers), closes the failed recognizer on a best-effort basis,
+creates the same `num_hands=2` video recognizer, and emits `available:true`
+only after recreation succeeds. Diagnostics and close failures go to stderr;
+stdout remains JSONL. Restart attempts are limited within a time window. If
+the limit is reached or recreation fails, the worker exits safely.

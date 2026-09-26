@@ -126,6 +126,15 @@ emits `CAMERA_STATE available:true` and resumes with a fresh baseline. This is
 not a full camera reconnect manager; persistent camera failures should be
 diagnosed at the device/permission level.
 
+The worker also has limited recovery for an occasional MediaPipe Gesture
+Recognizer graph runtime failure. It reports diagnostics only on stderr,
+clears all visual continuity state, recreates the same `num_hands=2` video
+recognizer, and emits `CAMERA_STATE available:false` followed by
+`available:true` around the recovery. Restart attempts are bounded; repeated
+failures cause a safe exit instead of an infinite restart loop. This recovery
+does not change the JSONL protocol or claim that an underlying MediaPipe
+version issue is solved.
+
 ### Model file not found
 
 Confirm the exact path `models\gesture_recognizer.task` from the project root.
