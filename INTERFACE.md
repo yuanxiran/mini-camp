@@ -106,13 +106,10 @@ game-facing label, while `PALM` reports the normalized palm position.
 {"v":1,"type":"PALM","x":0.43,"y":0.58,"ts_ms":860}
 ```
 
-- `x` and `y` are normalized image coordinates.
+- `x` and `y` are normalized image coordinates clamped by the worker's
+  external protocol boundary to `[0.0, 1.0]`.
 - They are calculated as the arithmetic mean of landmarks `0, 5, 9, 13, 17`
   from the same Gesture Recognizer result.
-- The current code does not explicitly clamp the values to `[0, 1]`; the
-  model normally returns normalized coordinates, but an edge-of-frame value
-  may be slightly outside that range. This is a pending integration detail,
-  not a promise of clamped output.
 - `PALM` is emitted at approximately 10 Hz while a hand is detected. No fake
   `x: 0, y: 0` message is emitted for `NO_HAND`.
 
@@ -177,3 +174,15 @@ The consuming application should:
 
 This document describes the current Python worker only; it is not a complete
 Qt implementation.
+
+## 8. Runtime camera-read failures
+
+The initial camera-open failure emits `CAMERA_STATE available:false` and exits.
+After a successful startup, a single failed `camera.read()` is treated as a
+short transient gap. The worker waits for three consecutive failed reads before
+emitting one `CAMERA_STATE available:false` and resetting frame-derived state.
+During the unavailable period it emits no `PALM`, `GESTURE`, `WAVE`,
+`SILENCE_STATE`, or `SILENCE_REACHED` messages. If a later frame is read
+successfully, it emits `CAMERA_STATE available:true` once and resumes with
+fresh tracking baselines. The worker does not implement a separate camera
+reopen/backoff subsystem.

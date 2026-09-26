@@ -113,6 +113,14 @@ reading fails and writes a human-readable explanation to stderr. Check whether
 another application is using the camera and review Windows camera permission;
 do not change system settings automatically.
 
+During an already running worker, one failed frame read is treated as a short
+transient gap. After three consecutive failed reads the worker emits
+`CAMERA_STATE available:false`, stops emitting frame-derived messages, clears
+old tracking state, and waits for a future successful frame. A successful frame
+emits `CAMERA_STATE available:true` and resumes with a fresh baseline. This is
+not a full camera reconnect manager; persistent camera failures should be
+diagnosed at the device/permission level.
+
 ### Model file not found
 
 Confirm the exact path `models\gesture_recognizer.task` from the project root.

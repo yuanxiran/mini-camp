@@ -21,6 +21,8 @@ PROJECT_DIR = Path(__file__).resolve().parent
 MODEL_PATH = PROJECT_DIR / "models" / "gesture_recognizer.task"
 PALM_EMIT_INTERVAL_SECONDS = 0.1
 SILENCE_STATE_EMIT_INTERVAL_SECONDS = 0.1
+CAMERA_READ_FAILURE_THRESHOLD = 3
+CAMERA_READ_RETRY_SLEEP_SECONDS = 0.01
 
 
 def emit(message: dict) -> None:
@@ -35,6 +37,11 @@ def timestamp_ms(started: float) -> int:
 def protocol_state(state: str) -> str:
     """Map the existing UI label to the JSONL protocol spelling."""
     return "NO_HAND" if state == "NO HAND" else state
+
+
+def clamp_unit(value: float) -> float:
+    """Clamp a normalized coordinate only at the external PALM boundary."""
+    return min(max(float(value), 0.0), 1.0)
 
 
 def parse_args() -> argparse.Namespace:
@@ -126,6 +133,9 @@ def run() -> int:
         last_palm_emit_at = None
         last_silence_emit_at = None
         last_silence_state = None
+        consecutive_read_failures = 0
+        stream_available = True
+        tracking_gap = False
         frame_count = 0
         fps = 0.0
         fps_started = time.perf_counter()
@@ -134,9 +144,45 @@ def run() -> int:
         while True:
             ok, frame = camera.read()
             if not ok:
-                emit({"v": 1, "type": "CAMERA_STATE", "available": False, "ts_ms": timestamp_ms(started)})
-                print("Could not read a frame from camera.", file=sys.stderr)
-                break
+                consecutive_read_failures += 1
+                tracking_gap = True
+                if (
+                    consecutive_read_failures >= CAMERA_READ_FAILURE_THRESHOLD
+                    and stream_available
+                ):
+                    emit({"v": 1, "type": "CAMERA_STATE", "available": False, "ts_ms": timestamp_ms(started)})
+                    print(
+                        f"Camera read failed {consecutive_read_failures} consecutive times.",
+                        file=sys.stderr,
+                    )
+                    stream_available = False
+                    # Drop frame-derived state. A later successful frame must
+                    # establish fresh baselines and cannot reuse stale data.
+                    motion_tracker.no_hand()
+                    wave_detector.reset_tracking()
+                    previous_wave_active = False
+                    last_gesture = None
+                    last_palm_emit_at = None
+                    last_silence_emit_at = None
+                    last_silence_state = None
+                time.sleep(CAMERA_READ_RETRY_SLEEP_SECONDS)
+                continue
+
+            if not stream_available:
+                emit({"v": 1, "type": "CAMERA_STATE", "available": True, "ts_ms": timestamp_ms(started)})
+                stream_available = True
+            consecutive_read_failures = 0
+
+            if tracking_gap:
+                # Even a short read gap must not become a synthetic movement
+                # or stillness interval when the next frame arrives.
+                motion_tracker.no_hand()
+                wave_detector.reset_tracking()
+                previous_wave_active = False
+                last_palm_emit_at = None
+                last_silence_emit_at = None
+                last_silence_state = None
+                tracking_gap = False
 
             now = time.perf_counter()
             current_ts_ms = timestamp_ms(started)
@@ -183,8 +229,8 @@ def run() -> int:
                     emit({
                         "v": 1,
                         "type": "PALM",
-                        "x": palm_x,
-                        "y": palm_y,
+                        "x": clamp_unit(palm_x),
+                        "y": clamp_unit(palm_y),
                         "ts_ms": current_ts_ms,
                     })
                     last_palm_emit_at = now
