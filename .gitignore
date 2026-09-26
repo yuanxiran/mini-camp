@@ -1,0 +1,5 @@
+.venv/
+.pip-cache/
+__pycache__/
+*.py[cod]
+models/*.task
