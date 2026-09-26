@@ -8,6 +8,7 @@
 - runs one MediaPipe Gesture Recognizer per frame;
 - reads the official gesture result and the same result's hand landmarks;
 - calculates palm position, motion, WAVE, STILL, and silence state;
+- tracks up to two hands and reports the validated `CUPPED_HANDS` pose;
 - writes machine-readable JSON Lines to stdout.
 
 It does not implement game story/scene logic, Qt UI, menu logic, game control,
@@ -55,6 +56,7 @@ than JSONL.
 | `WAVE` | Discrete event | One message when WAVE becomes active; no per-frame banner. |
 | `SILENCE_STATE` | Continuous state | About 10 Hz and immediately when state changes. |
 | `SILENCE_REACHED` | Discrete event | Once when valid continuous stillness reaches the current threshold. |
+| `TWO_HAND_POSE` | State change | `CUPPED_HANDS`/`NONE`, emitted when the pose state changes. |
 
 `GESTURE` and `PALM` are different messages: `GESTURE` reports a discrete
 game-facing label, while `PALM` reports the normalized palm position.
@@ -152,6 +154,35 @@ must reach the current internal threshold (currently about 2000 ms). Continued
 stillness does not repeat it. Clear MOVING or WAVE unlocks the next stillness
 period; `NO_HAND` alone does not.
 
+### TWO_HAND_POSE
+
+```json
+{"v":1,"type":"TWO_HAND_POSE","pose":"CUPPED_HANDS","ts_ms":5100}
+```
+
+`pose` is one of `CUPPED_HANDS` or `NONE`. This is a state-change message:
+entering `CUPPED_HANDS` emits once, continued holding does not repeat it, and
+leaving it emits one `NONE` message. The worker uses the same Gesture
+Recognizer inference for both hands and the validated standalone-demo
+geometry: two hands, open-enough hands, reasonable palm distance and height,
+the horizontal index-gap/wrist-gap relationship, and a real-time hold
+interval. This is a project pose state, not a MediaPipe gesture confidence;
+there is no synthetic `confidence` field.
+
+The existing `GESTURE`, `PALM`, `WAVE`, and `SILENCE_STATE` messages continue
+to describe only the selected primary hand. They are not duplicated as
+left/right messages when a second hand is present.
+
+### Primary-hand selection
+
+The recognizer runs with `num_hands=2`. When one hand is present it becomes the
+primary hand. When two are present, the worker keeps the primary hand matched
+to its previous palm position by nearest-neighbour distance, rather than
+assuming a stable MediaPipe result-array index. If the previous primary cannot
+be matched, the worker selects a deterministic screen-left fallback and
+rebuilds the motion/WAVE baseline. A newly selected hand therefore cannot
+inherit another hand's `motion`, `still_ms`, or WAVE history.
+
 ## 7. Qt/QProcess integration guidance
 
 The consuming application should:
@@ -171,6 +202,8 @@ The consuming application should:
    - `SILENCE_REACHED`: handle one completed stillness event.
 6. Treat `CAMERA_STATE available:false` or worker exit as invalid visual input;
    do not keep using the last gesture, palm, or STILL value as current data.
+7. Handle `TWO_HAND_POSE` as a state change; do not expect one message per
+   frame.
 
 This document describes the current Python worker only; it is not a complete
 Qt implementation.

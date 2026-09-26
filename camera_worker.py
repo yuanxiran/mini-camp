@@ -11,9 +11,11 @@ import argparse
 import json
 import sys
 import time
+from math import hypot
 from pathlib import Path
 
-from gesture_demo import GAME_GESTURE_NAMES, top_gesture
+from cupped_hands_demo import PoseStabilizer, evaluate_pose, make_hand_infos
+from gesture_demo import GAME_GESTURE_NAMES
 from hand_demo import SILENCE_BANNER_MS, MotionTracker, WaveDetector, draw_hand, palm_center
 
 
@@ -23,6 +25,7 @@ PALM_EMIT_INTERVAL_SECONDS = 0.1
 SILENCE_STATE_EMIT_INTERVAL_SECONDS = 0.1
 CAMERA_READ_FAILURE_THRESHOLD = 3
 CAMERA_READ_RETRY_SLEEP_SECONDS = 0.01
+PRIMARY_MATCH_MAX_DISTANCE = 0.20
 
 
 def emit(message: dict) -> None:
@@ -44,6 +47,47 @@ def clamp_unit(value: float) -> float:
     return min(max(float(value), 0.0), 1.0)
 
 
+class PrimaryHandSelector:
+    """Keep the existing single-hand stream attached to one hand across frames."""
+
+    def __init__(self) -> None:
+        self.previous_palm: tuple[float, float] | None = None
+
+    def reset(self) -> None:
+        self.previous_palm = None
+
+    def select(self, infos):
+        if not infos:
+            self.reset()
+            return None, False
+
+        changed = False
+        selected = None
+        if self.previous_palm is not None:
+            selected = min(
+                infos,
+                key=lambda hand: hypot(
+                    hand.palm_x - self.previous_palm[0],
+                    hand.palm_y - self.previous_palm[1],
+                ),
+            )
+            distance = hypot(
+                selected.palm_x - self.previous_palm[0],
+                selected.palm_y - self.previous_palm[1],
+            )
+            if distance > PRIMARY_MATCH_MAX_DISTANCE:
+                selected = None
+                changed = True
+
+        if selected is None:
+            # Deterministic fallback: infos are screen-x sorted by
+            # make_hand_infos, so this does not depend on MediaPipe array order.
+            selected = infos[0]
+
+        self.previous_palm = (selected.palm_x, selected.palm_y)
+        return selected, changed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MediaPipe hand camera JSONL worker")
     parser.add_argument(
@@ -54,10 +98,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def preview_frame(frame, result, snapshot, official_gesture, confidence, fps, cv2) -> None:
+def preview_frame(
+    frame,
+    infos,
+    snapshot,
+    official_gesture,
+    confidence,
+    pose,
+    fps,
+    cv2,
+) -> None:
     """Draw optional local diagnostics without writing anything to stdout."""
-    if result.hand_landmarks:
-        draw_hand(frame, result.hand_landmarks[0], cv2)
+    for hand in infos:
+        draw_hand(frame, hand.landmarks, cv2)
 
     game_gesture = GAME_GESTURE_NAMES.get(official_gesture, "NONE")
     lines = [
@@ -68,6 +121,7 @@ def preview_frame(frame, result, snapshot, official_gesture, confidence, fps, cv
         f"Motion: {snapshot.motion:.3f}",
         f"State: {snapshot.state}",
         f"still_ms: {snapshot.still_ms}",
+        f"Two-hand pose: {pose}",
         "Press Q to quit",
     ]
     for index, text in enumerate(lines):
@@ -105,7 +159,7 @@ def run() -> int:
     options = vision.GestureRecognizerOptions(
         base_options=python.BaseOptions(model_asset_path=str(MODEL_PATH)),
         running_mode=vision.RunningMode.VIDEO,
-        num_hands=1,
+        num_hands=2,
     )
 
     camera = None
@@ -127,7 +181,10 @@ def run() -> int:
 
         motion_tracker = MotionTracker()
         wave_detector = WaveDetector()
+        primary_selector = PrimaryHandSelector()
+        pose_stabilizer = PoseStabilizer()
         previous_wave_active = False
+        last_pose = None
         silence_banner_until = 0.0
         last_gesture = None
         last_palm_emit_at = None
@@ -160,7 +217,10 @@ def run() -> int:
                     # establish fresh baselines and cannot reuse stale data.
                     motion_tracker.no_hand()
                     wave_detector.reset_tracking()
+                    primary_selector.reset()
+                    pose_stabilizer = PoseStabilizer()
                     previous_wave_active = False
+                    last_pose = None
                     last_gesture = None
                     last_palm_emit_at = None
                     last_silence_emit_at = None
@@ -178,7 +238,10 @@ def run() -> int:
                 # or stillness interval when the next frame arrives.
                 motion_tracker.no_hand()
                 wave_detector.reset_tracking()
+                primary_selector.reset()
+                pose_stabilizer = PoseStabilizer()
                 previous_wave_active = False
+                last_pose = None
                 last_palm_emit_at = None
                 last_silence_emit_at = None
                 last_silence_state = None
@@ -201,12 +264,27 @@ def run() -> int:
             last_timestamp_ms = mp_timestamp_ms
             result = recognizer.recognize_for_video(mp_image, mp_timestamp_ms)
 
-            official_gesture, confidence = top_gesture(result)
-            game_gesture = GAME_GESTURE_NAMES.get(official_gesture, "NONE")
-            if not result.hand_landmarks:
+            infos = make_hand_infos(result)
+            primary_hand, primary_changed = primary_selector.select(infos)
+            pose_checks = evaluate_pose(infos)
+            pose = pose_stabilizer.update(now, pose_checks.candidate)
+            if pose != last_pose:
+                emit({
+                    "v": 1,
+                    "type": "TWO_HAND_POSE",
+                    "pose": pose,
+                    "ts_ms": current_ts_ms,
+                })
+                last_pose = pose
+
+            if primary_hand is None:
                 official_gesture = "None"
                 confidence = 0.0
                 game_gesture = "NONE"
+            else:
+                official_gesture = primary_hand.official_gesture
+                confidence = primary_hand.confidence
+                game_gesture = GAME_GESTURE_NAMES.get(official_gesture, "NONE")
 
             if game_gesture != last_gesture:
                 emit({
@@ -218,8 +296,14 @@ def run() -> int:
                 })
                 last_gesture = game_gesture
 
-            if result.hand_landmarks:
-                landmarks = result.hand_landmarks[0]
+            if primary_hand is not None:
+                landmarks = primary_hand.landmarks
+                if primary_changed:
+                    # A different hand must never inherit the previous hand's
+                    # motion, WAVE, or stillness baseline.
+                    motion_tracker.no_hand()
+                    wave_detector.reset_tracking()
+                    previous_wave_active = False
                 palm_x, palm_y = palm_center(landmarks)
                 wave_detector.update(now, palm_x)
                 wave_active = wave_detector.is_wave(now)
@@ -243,6 +327,7 @@ def run() -> int:
                     emit({"v": 1, "type": "SILENCE_REACHED", "ts_ms": current_ts_ms})
                     silence_banner_until = now + SILENCE_BANNER_MS / 1000.0
             else:
+                primary_selector.reset()
                 snapshot = motion_tracker.no_hand()
                 wave_detector.reset_tracking()
                 previous_wave_active = False
@@ -267,7 +352,16 @@ def run() -> int:
                 last_silence_state = json_state
 
             if args.preview:
-                preview_frame(frame, result, snapshot, official_gesture, confidence, fps, cv2)
+                preview_frame(
+                    frame,
+                    infos,
+                    snapshot,
+                    official_gesture,
+                    confidence,
+                    pose,
+                    fps,
+                    cv2,
+                )
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), ord("Q")):
                     break

@@ -1,8 +1,9 @@
 # Usage Guide
 
-This guide is for a first checkout on Windows. The project contains three
-visual demos and one headless worker; the worker is the intended process entry
-point for later Qt integration.
+This guide is for a first checkout on Windows. The project contains several
+visual validation demos and one formal headless worker. `camera_worker.py` is
+the process entry point intended for Qt/C++ integration; the demos remain
+useful for local diagnosis.
 
 ## 1. Project directory
 
@@ -100,6 +101,10 @@ With a usable camera, check these behaviors in order:
 7. Reaching the internal stillness duration emits one `SILENCE_REACHED`.
 8. Removing the hand emits `GESTURE NONE` when the gesture changes and
    `SILENCE_STATE state: "NO_HAND"`; it does not count as STILL.
+9. With two hands, a stable cupped pose emits one `TWO_HAND_POSE` message with
+   `pose: "CUPPED_HANDS"`; continued holding does not repeat it.
+10. Releasing the pose long enough emits one `TWO_HAND_POSE` message with
+    `pose: "NONE"`.
 
 The current worker has not been confirmed with a real camera in this execution
 environment. Do not treat a successful model-load check as camera validation.
@@ -137,6 +142,20 @@ The process may still be loading the model or opening the camera. Check stderr
 and wait for `CAMERA_STATE`; do not assume that one stdout read equals one JSON
 record.
 
+### Two hands and primary-hand continuity
+
+The formal worker runs Gesture Recognizer with `num_hands=2`. Existing
+single-hand messages continue to follow one selected primary hand; they are not
+duplicated into left/right streams. The worker follows that hand by nearest
+palm position when result-array order changes. If the primary disappears or a
+different hand cannot be matched safely, it rebuilds the motion/WAVE baseline
+before calculating new values.
+
+`TWO_HAND_POSE` is separate from `GESTURE`. It reports only `CUPPED_HANDS` or
+`NONE`, using the validated two-hand geometry and real-time hold intervals. The
+standalone `cupped_hands_demo.py` remains available when detailed threshold
+diagnostics are needed.
+
 ## 8. Existing standalone demos
 
 The existing demos remain independent:
@@ -160,6 +179,7 @@ headless JSONL process for later integration.
 | `gesture_demo.py` | Gesture Recognizer-only visual demo |
 | `hand_demo.py` | Hand Landmarker/motion visual demo |
 | `main.py` | Face demo |
+| `cupped_hands_demo.py` | Detailed two-hand CUPPED_HANDS threshold demo |
 | `models\` | Local `.task` model files |
 | `requirements.txt` | Python dependencies |
 | `INTERFACE.md` | JSONL contract for an integration consumer |

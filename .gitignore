@@ -3,3 +3,10 @@
 __pycache__/
 *.py[cod]
 models/*.task
+
+# Local worker/test captures; never part of the source handoff.
+worker_stdout.txt
+worker_stderr.txt
+worker_test_stdout.jsonl
+worker_test_stderr.txt
+*.log

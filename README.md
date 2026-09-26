@@ -1,8 +1,31 @@
-# MediaPipe Face Actions Demo
+# MediaPipe Vision Worker and Demos
 
-This is a local Windows demo that reads the default camera, runs MediaPipe
-Face Landmarker blendshape inference, and displays the values in an OpenCV
-window. Frames, videos, and face features are not saved or uploaded.
+This is a local Windows MediaPipe project. The formal integration entry point
+is `camera_worker.py`: it reads the default camera, recognizes hand gestures,
+tracks a stable primary hand, and writes versioned JSONL for a Qt/C++ consumer.
+The project also keeps independent Face, Hand, Gesture, Unified Hand, and
+Cupped Hands visual demos for validation. Frames and landmarks remain in local
+memory; no camera data is saved or uploaded.
+
+## First handoff reading order
+
+Start with this README. For environment setup and local commands, read
+[USAGE.md](USAGE.md). For the JSONL/QProcess contract, read
+[INTERFACE.md](INTERFACE.md). A consumer does not need to reproduce the
+MediaPipe geometry rules; it should consume the documented protocol states.
+
+The formal worker currently reports:
+
+- `CAMERA_STATE`
+- `GESTURE` (`PALM`, `GOOD`, `NONE`)
+- `PALM` coordinates
+- `WAVE`
+- `SILENCE_STATE` (`MOVING`, `STILL`, `NO_HAND`)
+- `SILENCE_REACHED`
+- `TWO_HAND_POSE` (`CUPPED_HANDS`, `NONE`)
+
+The Face Demo remains an independent experiment and is not part of the formal
+worker protocol.
 
 ## First run
 
@@ -126,10 +149,12 @@ hand or gesture demos and does not implement Camera Worker, JSONL, or Qt.
 
 ## Camera Worker
 
-`camera_worker.py` is the headless hand worker for a future Qt `QProcess`
-integration. It runs only Gesture Recognizer, reads gestures and hand
-landmarks from the same result, and writes one JSON object per stdout line.
-Human-readable errors go to stderr; stdout must remain JSONL-only.
+`camera_worker.py` is the headless hand worker for Qt `QProcess` integration.
+It runs one Gesture Recognizer with `num_hands=2`. The existing single-hand
+messages (`GESTURE`, `PALM`, `WAVE`, `SILENCE_STATE`, and
+`SILENCE_REACHED`) are based on a stable primary hand. A second hand is used
+for the independent `TWO_HAND_POSE` state; it does not create left/right
+versions of the existing single-hand messages.
 
 Run the worker:
 
@@ -144,10 +169,13 @@ Run the optional local preview (stdout is still JSONL-only):
 ```
 
 Message types are `CAMERA_STATE`, `GESTURE`, `PALM`, `WAVE`,
-`SILENCE_STATE`, and `SILENCE_REACHED`. Every message contains `v: 1` and a
+`SILENCE_STATE`, `SILENCE_REACHED`, and `TWO_HAND_POSE`. Every message contains `v: 1` and a
 worker-relative `ts_ms`. Gesture and WAVE messages are emitted on state/event
-changes; PALM and SILENCE_STATE are rate-limited to about 10 Hz. The worker
-does not include Face, Qt, game control, or camera-data storage.
+changes; PALM, SILENCE_STATE, and pose state changes follow the documented
+state/rate rules. `CUPPED_HANDS` uses the already validated geometry from the
+standalone demo: two open-enough hands, reasonable palm distance/height, an
+index-gap-to-wrist-gap ratio, and real-time hold stability. The worker does not
+include Face, game control, or camera-data storage.
 
 Documentation:
 
